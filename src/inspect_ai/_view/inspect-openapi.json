@@ -5260,6 +5260,206 @@
         "title": "EventsData",
         "type": "object"
       },
+      "FindMessagesCursor": {
+        "properties": {
+          "anchor": {
+            "title": "Anchor",
+            "type": "string"
+          }
+        },
+        "required": [
+          "anchor"
+        ],
+        "title": "FindMessagesCursor",
+        "type": "object"
+      },
+      "FindMessagesProjection": {
+        "description": "How the viewer currently shows the rows; a host sends only what it changed.",
+        "properties": {
+          "display_mode": {
+            "default": "rendered",
+            "enum": [
+              "rendered",
+              "raw"
+            ],
+            "title": "Display Mode",
+            "type": "string"
+          },
+          "tool_call_style": {
+            "default": "complete",
+            "enum": [
+              "complete",
+              "compact",
+              "omit"
+            ],
+            "title": "Tool Call Style",
+            "type": "string"
+          },
+          "unlabeled_roles": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Unlabeled Roles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "unlabeled_roles",
+          "tool_call_style",
+          "display_mode"
+        ],
+        "title": "FindMessagesProjection",
+        "type": "object"
+      },
+      "FindMessagesRequest": {
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FindMessagesCursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "direction": {
+            "enum": [
+              "forward",
+              "backward"
+            ],
+            "title": "Direction",
+            "type": "string"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "limit": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "projection": {
+            "$ref": "#/components/schemas/FindMessagesProjection",
+            "default": {
+              "display_mode": "rendered",
+              "tool_call_style": "complete",
+              "unlabeled_roles": []
+            }
+          },
+          "sample_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "title": "Sample Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sample_id",
+          "epoch",
+          "text",
+          "direction",
+          "limit",
+          "projection"
+        ],
+        "title": "FindMessagesRequest",
+        "type": "object"
+      },
+      "FindMessagesResponse": {
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/FindMessagesRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "total": {
+            "$ref": "#/components/schemas/FindMessagesTotal"
+          }
+        },
+        "required": [
+          "rows",
+          "total",
+          "complete"
+        ],
+        "title": "FindMessagesResponse",
+        "type": "object"
+      },
+      "FindMessagesRow": {
+        "properties": {
+          "anchor": {
+            "title": "Anchor",
+            "type": "string"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "texts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Texts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "anchor",
+          "index",
+          "count",
+          "texts"
+        ],
+        "title": "FindMessagesRow",
+        "type": "object"
+      },
+      "FindMessagesTotal": {
+        "properties": {
+          "occurrences": {
+            "title": "Occurrences",
+            "type": "integer"
+          },
+          "relation": {
+            "enum": [
+              "eq",
+              "gte"
+            ],
+            "title": "Relation",
+            "type": "string"
+          },
+          "rows": {
+            "title": "Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "occurrences",
+          "relation"
+        ],
+        "title": "FindMessagesTotal",
+        "type": "object"
+      },
       "GenerateConfig": {
         "description": "Model generation options.",
         "properties": {
@@ -11676,6 +11876,45 @@
           }
         },
         "summary": "Api Events"
+      }
+    },
+    "/find-messages/{log}": {
+      "post": {
+        "operationId": "api_find_messages_find_messages__log__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "log",
+            "required": true,
+            "schema": {
+              "title": "Log",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FindMessagesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FindMessagesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Find Messages"
       }
     },
     "/flow": {
