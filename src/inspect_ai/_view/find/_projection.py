@@ -116,6 +116,7 @@ def _content(builder: _Builder, item: Content) -> None:
     elif isinstance(item, ContentDocument):
         builder.add("content", item.filename)
     elif isinstance(item, ContentToolUse):
+        builder.add("tool_call", f"tool: {item.name}", chrome=True)
         builder.add("tool_call", item.context or "")
         builder.add("tool_call", item.name)
         builder.add("tool_call", item.arguments)
@@ -155,6 +156,9 @@ def _tool_call(
     call: ToolCall,
     style: ToolCallStyle,
 ) -> None:
+    builder.add("tool_call", f"tool: {call.function}", chrome=True)
+    if call.view is not None and call.view.title:
+        builder.add("tool_call", call.view.title, chrome=True)
     builder.add("tool_call", call.function)
     for value in call.arguments.values():
         builder.add("tool_call", _text(value))

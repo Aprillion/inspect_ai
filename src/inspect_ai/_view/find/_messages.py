@@ -1,5 +1,6 @@
 """The find-messages endpoint: request/response models and the search over one sample."""
 
+import asyncio
 import json
 import re
 import time
@@ -163,7 +164,7 @@ async def find_messages(
         request.projection.tool_call_style,
         request.projection.display_mode,
     )
-    return _page(index, options, request)
+    return await _page(index, options, request)
 
 
 class _RowMatches(NamedTuple):
@@ -171,7 +172,7 @@ class _RowMatches(NamedTuple):
     texts: list[str]
 
 
-def _page(
+async def _page(
     index: _SampleIndex, options: ProjectionOptions, request: FindMessagesRequest
 ) -> FindMessagesResponse:
     query = compile_query(request.text)
@@ -190,6 +191,7 @@ def _page(
     page: list[FindMessagesRow] = []
     occurrences = 0
     deadline: float | None = None
+    scanned = 0
     if request.direction == "forward":
         i = 0 if cursor_i is None else cursor_i + 1
         step = 1
@@ -215,6 +217,11 @@ def _page(
             if deadline is None:
                 deadline = time.perf_counter() + _SCAN_BUDGET_S
         i += step
+        scanned += 1
+        # budget starts after the first hit; a miss still has to scan to EOF
+        # for relation=eq, so yield so the view-server loop is not pinned
+        if scanned % 32 == 0:
+            await asyncio.sleep(0)
     reached_edge = i == done_at
     scan_done = reached_edge and index.complete
     return FindMessagesResponse(

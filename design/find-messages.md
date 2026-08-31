@@ -45,10 +45,11 @@ taken; only prior rows are consulted, so anchors never change on live append. `i
 `project_row(row, anchor, options, include_chrome=True) -> [Segment{anchor, field, text}]` emits
 the row's data text in render order: role heading (`role` / `tool: fn`, unless in `unlabeled_roles`),
 message text blocks, `Reasoning` + reasoning text (the summary when redacted or empty), citation title (else quoted text,
-else URL), data blocks as JSON, document filenames, server tool name / arguments / result or error; per tool call the function name, each argument (strings as is, else
+else URL), data blocks as JSON, document filenames, server tool name / arguments / result or error; per tool call `tool: {function}` (and the call's
+view title when set), the function name, each argument (strings as is, else
 `json.dumps`), then the tool message's output text or error message. `tool_call_style`: `omit` → no
 tool text; `compact` → no tool output; `complete` → all. Segments join with `"\n"`, so a heading never
-glues onto the body. Chrome is the text the viewer adds (role heading, `Reasoning`);
+glues onto the body. Chrome is the text the viewer adds (role heading, `tool: fn`, `Reasoning`);
 `include_chrome=False` gives data-only segments for grep.
 
 Message and reasoning text pass through `strip_markdown_for_count` (skipped under `display_mode`

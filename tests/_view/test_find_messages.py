@@ -352,10 +352,27 @@ def test_projection_tool_calls_plain_text_and_styles() -> None:
         ChatMessageTool(id="t", tool_call_id="c1", function="bash", content="hi\n"),
     ]
     row = message_rows(messages)[0]
-    complete = ["assistant", "visible", "bash", "echo hi", "5", '{"x": "ü"}']
+    complete = [
+        "assistant",
+        "visible",
+        "tool: bash",
+        "Run {{cmd}}",
+        "bash",
+        "echo hi",
+        "5",
+        '{"x": "ü"}',
+    ]
     assert [s.text for s in project_row(row, "a")] == complete + ["hi\n"]
     compact = ProjectionOptions(tool_call_style="compact")
     assert [s.text for s in project_row(row, "a", compact)] == complete
+    assert [s.text for s in project_row(row, "a", include_chrome=False)] == [
+        "visible",
+        "bash",
+        "echo hi",
+        "5",
+        '{"x": "ü"}',
+        "hi\n",
+    ]
     omit = ProjectionOptions(tool_call_style="omit")
     assert [s.text for s in project_row(row, "a", omit)] == ["assistant", "visible"]
 
@@ -427,6 +444,7 @@ def test_projection_tool_error_replaces_output() -> None:
     row = message_rows(messages)[0]
     assert [s.text for s in project_row(row, "a")] == [
         "assistant",
+        "tool: python",
         "python",
         "1/0",
         "took too long",
@@ -877,6 +895,48 @@ def test_endpoint_scan_budget_continues_after_a_slow_first_match(
     # rest of this small sample still fits on the first page
     assert page["total"]["rows"] == 5
     assert page["total"]["relation"] == "eq"
+
+
+def test_endpoint_finds_compact_tool_chrome(client: TestClient, tmp_path: Path) -> None:
+    log = tmp_path / "tool.eval"
+    write_sample_log(
+        log,
+        [
+            ChatMessageAssistant(
+                id="a",
+                content="",
+                tool_calls=[
+                    ToolCall(id="c1", function="bash", arguments={"cmd": "ls"})
+                ],
+            ),
+        ],
+    )
+    compact = {**PROJECTION, "tool_call_style": "compact"}
+    page = find(client, "tool: bash", log=log, sample_id="s", projection=compact)
+    assert page["total"] == {"rows": 1, "occurrences": 1, "relation": "eq"}
+
+
+def test_endpoint_miss_yields_the_event_loop(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    yields = {"n": 0}
+    original = asyncio.sleep
+
+    async def sleep(delay: float, result: object = None) -> object:
+        yields["n"] += 1
+        return await original(delay, result)
+
+    monkeypatch.setattr("inspect_ai._view.find._messages.asyncio.sleep", sleep)
+    log = tmp_path / "miss.eval"
+    write_sample_log(
+        log,
+        [ChatMessageUser(id=f"u{i}", content="aaa") for i in range(40)],
+    )
+    page = find(client, "zzz", log=log, sample_id="s", limit=10)
+    assert page["total"] == {"rows": 0, "occurrences": 0, "relation": "eq"}
+    assert yields["n"] >= 1
 
 
 def test_endpoint_unknown_cursor_restarts_at_near_edge(client: TestClient) -> None:
