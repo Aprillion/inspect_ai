@@ -782,6 +782,103 @@ def test_endpoint_paging_forward_and_backward(client: TestClient) -> None:
     assert backward == everything[::-1]
 
 
+def test_endpoint_page_total_is_this_page_until_the_scan_ends(
+    client: TestClient, tmp_path: Path
+) -> None:
+    log = tmp_path / "hits.eval"
+    write_sample_log(
+        log,
+        [ChatMessageUser(id=f"u{i}", content="hit") for i in range(5)],
+    )
+    first = find(client, "hit", log=log, sample_id="s", limit=2)
+    assert first["total"] == {"rows": 2, "occurrences": 2, "relation": "gte"}
+    assert first["complete"] is True
+    mid = find(
+        client,
+        "hit",
+        log=log,
+        sample_id="s",
+        limit=2,
+        cursor={"anchor": first["rows"][-1]["anchor"]},
+    )
+    assert mid["total"] == {"rows": 2, "occurrences": 2, "relation": "gte"}
+    last = find(
+        client,
+        "hit",
+        log=log,
+        sample_id="s",
+        limit=2,
+        cursor={"anchor": mid["rows"][-1]["anchor"]},
+    )
+    assert last["total"] == {"rows": 1, "occurrences": 1, "relation": "eq"}
+
+
+def test_endpoint_scan_budget_stops_the_page_after_the_first_match(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from inspect_ai._view.find._messages import _SCAN_BUDGET_S
+
+    ticks = {"n": 0}
+
+    def now() -> float:
+        ticks["n"] += 1
+        return ticks["n"] * _SCAN_BUDGET_S
+
+    monkeypatch.setattr("inspect_ai._view.find._messages.time.perf_counter", now)
+    log = tmp_path / "slow.eval"
+    write_sample_log(
+        log,
+        [ChatMessageUser(id=f"u{i}", content="hit") for i in range(5)],
+    )
+    page = find(client, "hit", log=log, sample_id="s", limit=10)
+    assert page["total"]["rows"] == 1
+    assert page["total"]["relation"] == "gte"
+    monkeypatch.undo()
+    rest = find(
+        client,
+        "hit",
+        log=log,
+        sample_id="s",
+        limit=10,
+        cursor={"anchor": page["rows"][-1]["anchor"]},
+    )
+    assert rest["total"]["rows"] == 4
+    assert rest["total"]["relation"] == "eq"
+
+
+def test_endpoint_scan_budget_continues_after_a_slow_first_match(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from inspect_ai._util.textsearch import FoldedText
+    from inspect_ai._view.find._messages import _SampleIndex
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "inspect_ai._view.find._messages.time",
+        SimpleNamespace(perf_counter=lambda: clock["t"]),
+    )
+    original = _SampleIndex.folded_row
+
+    def fold(self: _SampleIndex, i: int, options: ProjectionOptions) -> FoldedText:
+        if clock["t"] == 0.0:
+            clock["t"] = 1.0
+        return original(self, i, options)
+
+    monkeypatch.setattr(_SampleIndex, "folded_row", fold)
+    log = tmp_path / "slow.eval"
+    write_sample_log(
+        log,
+        [ChatMessageUser(id=f"u{i}", content="hit") for i in range(5)],
+    )
+    page = find(client, "hit", log=log, sample_id="s", limit=10)
+    # first fold "took" 1s; the 50ms budget starts after that hit, so the
+    # rest of this small sample still fits on the first page
+    assert page["total"]["rows"] == 5
+    assert page["total"]["relation"] == "eq"
+
+
 def test_endpoint_unknown_cursor_restarts_at_near_edge(client: TestClient) -> None:
     everything = find(client, "kumquat", limit=100)["rows"]
     stale = {"anchor": "gone"}
@@ -1007,7 +1104,7 @@ def test_endpoint_running_sample_from_buffer(
     )
 
     result = find(client, "kumquat", log=Path(log_path), sample_id="live")
-    assert result["total"] == {"rows": 2, "occurrences": 2, "relation": "eq"}
+    assert result["total"] == {"rows": 2, "occurrences": 2, "relation": "gte"}
     assert result["complete"] is False
     assert [(r["index"], r["anchor"], r["texts"]) for r in result["rows"]] == [
         (0, "u1", ["kumquat"]),

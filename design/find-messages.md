@@ -28,10 +28,12 @@ display_mode?}}` returns `{rows: [{anchor, index, count, texts}], total: {rows, 
 - `count`: non-overlapping folded matches in the row's source projection — an estimate of the DOM,
   which the client corrects. `texts`: all distinct projection substrings matched, in first-appearance
   order; the client highlights them literally.
-- `total.rows` and `total.occurrences` (Σ `count`) with `relation`: inspect_ai always sends `"eq"` (it
-  scans the whole sample); hawk/chunked sources report `"gte"` when they did not. `complete` = the universe was
-  fully observed: true for a sealed sample, false when served from a running sample's buffer. Empty
-  `text` → empty result (the user is typing). Models: `_view/find/_messages.py`.
+- `total` is **this page** (`rows`/`occurrences` = this response). `relation` is `"eq"` only when
+  this request walked off the end of the source in `direction` and the sample is sealed; otherwise
+  `"gte"` and the client sums pages (the band is M+ until then). A page stops at `limit` matching
+  rows or ~50ms after the first match, so the first hits can paint while the rest of the scan
+  continues. `complete` is whether the sample is sealed (a running buffer is never `complete`).
+  Empty `text` → empty result (the user is typing). Models: `_view/find/_messages.py`.
 
 ## Projection (`inspect_ai._view.find`)
 
@@ -97,8 +99,11 @@ accepted over stat-ing a possibly remote file on every keystroke.
 - No render parity with the viewer (tool views, arg summaries, citation numbers, notices): the server only says which rows match, `count` is an estimate the client corrects, and `texts` are projection substrings the DOM contains anyway; porting the renderer would be code that rots for no user-visible gain.
 - No occurrences or offsets on the wire: positions exist only in the DOM; the server ships variants, the client finds them literally.
 - Fold in Python, not JS: `RegExp` `iu` is simple case folding only (no ß/ss, İ/i, accents), and hawk's server implements the same contract.
-- No `"gte"` totals from inspect_ai: the whole sample is visible, so counts are exact and paging only bounds response size.
-- No running-delta correction of M on the client: M is the server's number, N clamps in-row.
+- Inspect_ai `gte` is a **page** that has not walked off a sealed sample yet
+  (limit or the ~50ms budget), not a refusal to count. Exact M is the client's
+  sum once a page reports `eq`.
+- No running-delta correction of M from the **DOM**: in-row N uses DOM counts;
+  M stays the summed server pages.
 - Anchor-only cursor: anchors are unique by construction (duplicate rule), so a row is a position.
 - No `texts` cap: a folded term has few distinct spellings, and a cap would hide real variants.
 

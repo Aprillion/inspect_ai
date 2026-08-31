@@ -2,7 +2,7 @@
 
 import json
 import re
-from bisect import bisect_left, bisect_right
+import time
 from collections import OrderedDict
 from dataclasses import replace
 from typing import Any, Literal, NamedTuple
@@ -36,6 +36,10 @@ from ._projection import DisplayMode, ProjectionOptions, ToolCallStyle, project_
 from ._rows import MessageRow, message_rows, messages_from_events, row_anchors
 
 MAX_LIMIT = 1000  # a guess: bounds response size, the client pages
+# Stop a page once we have at least one match and this much time has passed
+# so the first hits can paint while M is still M+. 50ms is an uncalibrated
+# guess for "first paint feels instant"; tighten if the first page is heavy.
+_SCAN_BUDGET_S = 0.05
 
 
 class FindMessagesCursor(BaseModel):
@@ -75,10 +79,13 @@ class FindMessagesRow(BaseModel):
 
 class FindMessagesTotal(BaseModel):
     rows: int
+    """Matching rows in this page, not the universe."""
     occurrences: int
+    """Σ `count` of this page's rows."""
     relation: Literal["eq", "gte"]
-    """inspect_ai always sends "eq" (the whole sample is scanned); a host that
-    did not scan its whole universe (chunked or remote sources) sends "gte"."""
+    """`eq` only when this request walked off the end of the source in
+    `direction` and the sample is sealed. Otherwise `gte`: the client sums
+    pages until then, and the band shows M+."""
 
 
 class FindMessagesResponse(BaseModel):
@@ -98,24 +105,34 @@ class _SampleIndex:
         self.anchors: list[str] = row_anchors(self.rows)
         self.anchor_index = {anchor: i for i, anchor in enumerate(self.anchors)}
         self.roles = frozenset(row.message.role for row in self.rows)
-        self._folded: OrderedDict[ProjectionOptions, list[FoldedText]] = OrderedDict()
+        self._folded: OrderedDict[ProjectionOptions, list[FoldedText | None]] = (
+            OrderedDict()
+        )
 
-    def folded_rows(self, options: ProjectionOptions) -> list[FoldedText]:
+    def folded_row(self, i: int, options: ProjectionOptions) -> FoldedText:
         # roles absent from the sample cannot change the projection, so they
         # do not get their own cache entry
         options = replace(options, unlabeled_roles=options.unlabeled_roles & self.roles)
         folded = self._folded.get(options)
-        if folded is not None:
-            self._folded.move_to_end(options)
-        else:
-            folded = [
-                FoldedText("\n".join(s.text for s in project_row(row, anchor, options)))
-                for row, anchor in zip(self.rows, self.anchors, strict=True)
-            ]
+        if folded is None:
+            folded = [None] * len(self.rows)
             self._folded[options] = folded
             while len(self._folded) > _MAX_FOLDED_VARIANTS:
                 self._folded.popitem(last=False)
-        return folded
+        else:
+            self._folded.move_to_end(options)
+        at = folded[i]
+        if at is None:
+            at = FoldedText(
+                "\n".join(
+                    s.text for s in project_row(self.rows[i], self.anchors[i], options)
+                )
+            )
+            folded[i] = at
+        return at
+
+    def folded_rows(self, options: ProjectionOptions) -> list[FoldedText]:
+        return [self.folded_row(i, options) for i in range(len(self.rows))]
 
 
 _MAX_FOLDED_VARIANTS = (
@@ -146,7 +163,7 @@ async def find_messages(
         request.projection.tool_call_style,
         request.projection.display_mode,
     )
-    return _page(index, index.folded_rows(options), request)
+    return _page(index, options, request)
 
 
 class _RowMatches(NamedTuple):
@@ -155,34 +172,57 @@ class _RowMatches(NamedTuple):
 
 
 def _page(
-    index: _SampleIndex, rows: list[FoldedText], request: FindMessagesRequest
+    index: _SampleIndex, options: ProjectionOptions, request: FindMessagesRequest
 ) -> FindMessagesResponse:
-    anchors = index.anchors
     query = compile_query(request.text)
-    matching = [
-        (i, matches)
-        for i, matches in ((i, _row_matches(r, query)) for i, r in enumerate(rows))
-        if matches.occurrences
-    ]
-    indices = [i for i, _ in matching]
-    cursor = index.anchor_index.get(request.cursor.anchor) if request.cursor else None
+    if query is None:
+        return FindMessagesResponse(
+            rows=[],
+            total=FindMessagesTotal(
+                rows=0,
+                occurrences=0,
+                relation="eq" if index.complete else "gte",
+            ),
+            complete=index.complete,
+        )
+    n = len(index.rows)
+    cursor_i = index.anchor_index.get(request.cursor.anchor) if request.cursor else None
+    page: list[FindMessagesRow] = []
+    occurrences = 0
+    deadline: float | None = None
     if request.direction == "forward":
-        first = bisect_right(indices, cursor) if cursor is not None else 0
-        page = matching[first : first + request.limit]
+        i = 0 if cursor_i is None else cursor_i + 1
+        step = 1
+        done_at = n
     else:
-        last = bisect_left(indices, cursor) if cursor is not None else len(matching)
-        page = matching[max(0, last - request.limit) : last][::-1]
-    return FindMessagesResponse(
-        rows=[
-            FindMessagesRow(
-                anchor=anchors[i], index=i, count=m.occurrences, texts=m.texts
+        i = n - 1 if cursor_i is None else cursor_i - 1
+        step = -1
+        done_at = -1
+    while i != done_at and len(page) < request.limit:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+        matches = _row_matches(index.folded_row(i, options), query)
+        if matches.occurrences:
+            page.append(
+                FindMessagesRow(
+                    anchor=index.anchors[i],
+                    index=i,
+                    count=matches.occurrences,
+                    texts=matches.texts,
+                )
             )
-            for i, m in page
-        ],
+            occurrences += matches.occurrences
+            if deadline is None:
+                deadline = time.perf_counter() + _SCAN_BUDGET_S
+        i += step
+    reached_edge = i == done_at
+    scan_done = reached_edge and index.complete
+    return FindMessagesResponse(
+        rows=page,
         total=FindMessagesTotal(
-            rows=len(matching),
-            occurrences=sum(m.occurrences for _, m in matching),
-            relation="eq",
+            rows=len(page),
+            occurrences=occurrences,
+            relation="eq" if scan_done else "gte",
         ),
         complete=index.complete,
     )
