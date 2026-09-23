@@ -2,12 +2,14 @@ import json
 import pathlib
 import re
 import zipfile
-from typing import Literal, NamedTuple
+from typing import Any, Callable, Literal, NamedTuple
 
 import pytest
 from test_helpers.chunked_corpus import CORPUS_SMALL_CHUNK_SIZE, ChunkedCorpus
 
 from inspect_ai._util.constants import get_deserializing_context
+from inspect_ai._util.hash import mm3_hash
+from inspect_ai._util.zipfile import zipfile_compress_kwargs
 from inspect_ai.event import ModelEvent, SampleInitEvent
 from inspect_ai.log._convert import convert_eval_logs
 from inspect_ai.log._edit import (
@@ -682,3 +684,454 @@ def test_convert_chunked_cli_hidden():
     command = log_command.get_command(None, "convert-chunked")
     assert command is not None
     assert command.hidden
+
+
+def _round_trip_log() -> EvalLog:
+    """One sample with tool calls, text long enough to become attachments, and events."""
+    from inspect_ai.event import ModelEvent, ToolEvent
+    from inspect_ai.log._log import EvalConfig, EvalDataset, EvalSpec
+    from inspect_ai.model import (
+        ChatMessage,
+        ChatMessageAssistant,
+        ChatMessageSystem,
+        ChatMessageTool,
+        ChatMessageUser,
+        GenerateConfig,
+        ModelOutput,
+    )
+    from inspect_ai.tool import ToolCall
+
+    call = ToolCall(id="c1", function="bash", arguments={"cmd": "ls"})
+    long_question = "question " * 30
+    long_output = "output line\n" * 30
+    long_answer = "answer " * 30
+    system = ChatMessageSystem(id="s1", content="be terse")
+    user = ChatMessageUser(id="u1", content=long_question)
+    calling = ChatMessageAssistant(id="a1", content="", tool_calls=[call])
+    tool = ChatMessageTool(
+        id="t1", tool_call_id="c1", function="bash", content=long_output
+    )
+    answer = ChatMessageAssistant(id="a2", content=long_answer)
+    # a second turn repeating the first verbatim but with fresh ids: the
+    # chunked shape pools messages by content, so these exercise what that
+    # does to ids
+    user_again = ChatMessageUser(id="u2", content=long_question)
+    answer_again = ChatMessageAssistant(id="a3", content=long_answer)
+    messages: list[ChatMessage] = [
+        system,
+        user,
+        calling,
+        tool,
+        answer,
+        user_again,
+        answer_again,
+    ]
+
+    def model_event(
+        input: list[ChatMessage], output: ChatMessageAssistant
+    ) -> ModelEvent:
+        return ModelEvent(
+            model="mockllm/model",
+            input=input,
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(),
+            output=ModelOutput.from_message(output),
+        )
+
+    return EvalLog(
+        status="success",
+        eval=EvalSpec(
+            created="2025-01-01T00:00:00Z",
+            task="task",
+            task_id="task_id",
+            dataset=EvalDataset(),
+            model="model",
+            config=EvalConfig(),
+        ),
+        samples=[
+            EvalSample(
+                id="s",
+                epoch=1,
+                input=[system, user],
+                target="",
+                messages=messages,
+                store={"k": "v"},
+                metadata={"m": 1},
+                events=[
+                    model_event([system, user], calling),
+                    ToolEvent(
+                        id="c1",
+                        function="bash",
+                        arguments={"cmd": "ls"},
+                        result=long_output,
+                    ),
+                    model_event(messages[:4], answer),
+                    model_event(messages[:6], answer_again),
+                ],
+            )
+        ],
+    )
+
+
+@pytest.fixture
+def monolith_and_chunked(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """The round-trip sample written as a monolith and converted to chunks."""
+    monolith = tmp_path / "log.eval"
+    write_eval_log(_round_trip_log(), str(monolith), "eval")
+    convert_eval_logs_to_chunked(str(monolith), str(tmp_path / "chunked"), chunk_size=2)
+    return monolith, tmp_path / "chunked" / "log.eval"
+
+
+def _without_message_ids(value: Any) -> Any:
+    """Strip every chat message's `id` from a jsonable sample.
+
+    The chunked converter pools messages under a content hash that excludes
+    `id` (`inspect_ai.event._pool._msg_hash`), so content-identical messages
+    come back sharing the first one's id. That is a converter defect, not a
+    reader one; comparing without ids keeps the read's own contract testable.
+    """
+    if isinstance(value, dict):
+        keys = value.keys() - ({"id"} if {"role", "content"} <= value.keys() else set())
+        return {key: _without_message_ids(value[key]) for key in keys}
+    if isinstance(value, list):
+        return [_without_message_ids(item) for item in value]
+    return value
+
+
+@pytest.mark.parametrize("resolve_attachments", ["full", "core", False])
+async def test_read_eval_log_sample_reads_chunked_shape(
+    monolith_and_chunked: tuple[pathlib.Path, pathlib.Path],
+    resolve_attachments: Literal["full", "core", False],
+) -> None:
+    """A chunked sample reads back as its monolith does, up to pooled message ids."""
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    monolith, chunked = monolith_and_chunked
+    expected = await read_eval_log_sample_async(
+        str(monolith), "s", 1, resolve_attachments=resolve_attachments
+    )
+    actual = await read_eval_log_sample_async(
+        str(chunked), "s", 1, resolve_attachments=resolve_attachments
+    )
+    assert _without_message_ids(actual.model_dump(mode="json")) == _without_message_ids(
+        expected.model_dump(mode="json")
+    )
+    # the fixture's repeated turn survives as content but not as identity
+    assert [message.id for message in expected.messages] == [
+        "s1",
+        "u1",
+        "a1",
+        "t1",
+        "a2",
+        "u2",
+        "a3",
+    ]
+    assert [message.id for message in actual.messages] == [
+        "s1",
+        "u1",
+        "a1",
+        "t1",
+        "a2",
+        "u1",
+        "a2",
+    ]
+    if resolve_attachments is False:
+        # the converter did extract the long turns; the read put them back
+        assert len(expected.attachments) >= 3
+        assert expected.messages[1].text.startswith("question ")
+
+    partial = await read_eval_log_sample_async(
+        str(chunked), "s", 1, exclude_fields={"events", "store"}
+    )
+    assert partial.events == [] and partial.store == {}
+    monolith_messages = (
+        await read_eval_log_sample_async(str(monolith), "s", 1)
+    ).messages
+    assert _without_message_ids(
+        [message.model_dump(mode="json") for message in partial.messages]
+    ) == _without_message_ids(
+        [message.model_dump(mode="json") for message in monolith_messages]
+    )
+    with pytest.raises(IndexError):
+        await read_eval_log_sample_async(str(chunked), "missing", 1)
+
+
+async def test_read_chunked_sample_excludes_fields_without_losing_content(
+    monolith_and_chunked: tuple[pathlib.Path, pathlib.Path],
+) -> None:
+    """An excluded field changes what comes back, not what the rest resolves to."""
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    monolith, chunked = monolith_and_chunked
+    for exclude in ({"attachments"}, {"events"}):
+        expected = await read_eval_log_sample_async(
+            str(monolith), "s", 1, exclude_fields=exclude
+        )
+        actual = await read_eval_log_sample_async(
+            str(chunked), "s", 1, exclude_fields=exclude
+        )
+        # the attachments sequence is read either way, so the text the converter
+        # extracted is inlined either way and no `attachment://<index>` survives
+        assert actual.messages[1].text == expected.messages[1].text
+        assert actual.messages[1].text.startswith("question ")
+        assert actual.attachments == expected.attachments
+
+
+def _rewritten_archive(
+    source: pathlib.Path,
+    target: pathlib.Path,
+    drop: Callable[[str], bool] = lambda _: False,
+    replace: dict[str, bytes] | None = None,
+) -> pathlib.Path:
+    """Copy a chunked archive, dropping entries and replacing entry contents."""
+    replace = replace or {}
+    with zipfile.ZipFile(source) as src:
+        names = src.namelist()
+        contents = {name: src.read(name) for name in names}
+    with zipfile.ZipFile(target, "w", **zipfile_compress_kwargs) as out:
+        for name in names:
+            if not drop(name):
+                out.writestr(name, replace.get(name, contents[name]))
+    return target
+
+
+def _damaged_archives(
+    chunked: pathlib.Path, tmp_path: pathlib.Path
+) -> dict[str, tuple[pathlib.Path, str]]:
+    """Damaged copies of a chunked archive, each with what its error must name."""
+    with zipfile.ZipFile(chunked) as zf:
+        shell_name = shell_entry_name("s", 1)
+        shell = json.loads(zf.read(shell_name))
+        message_starts = _chunk_starts(set(zf.namelist()), "s", 1, "messages")
+    assert len(message_starts) >= 3, "fixture must span several message chunks"
+    gap = chunk_entry_name("s", 1, "messages", message_starts[1])
+
+    beyond = dict(shell, message_refs=[[0, 10**6]])
+    without = {key: value for key, value in shell.items() if key != "message_refs"}
+    return {
+        "no attachments sequence": (
+            _rewritten_archive(
+                chunked,
+                tmp_path / "no_attachments.eval",
+                drop=lambda name: "/attachments/" in name,
+            ),
+            "attachments sequence holds 0",
+        ),
+        "messages gap": (
+            _rewritten_archive(
+                chunked, tmp_path / "gap.eval", drop=lambda name: name == gap
+            ),
+            "missing messages items",
+        ),
+        "refs beyond the pool": (
+            _rewritten_archive(
+                chunked,
+                tmp_path / "beyond.eval",
+                replace={shell_name: json.dumps(beyond).encode()},
+            ),
+            "refers to messages [0, 1000000)",
+        ),
+        "shell without message_refs": (
+            _rewritten_archive(
+                chunked,
+                tmp_path / "no_refs.eval",
+                replace={shell_name: json.dumps(without).encode()},
+            ),
+            "has no 'message_refs'",
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "no attachments sequence",
+        "messages gap",
+        "refs beyond the pool",
+        "shell without message_refs",
+    ],
+)
+async def test_read_chunked_sample_rejects_an_archive_it_cannot_reassemble(
+    monolith_and_chunked: tuple[pathlib.Path, pathlib.Path],
+    tmp_path: pathlib.Path,
+    damage: str,
+) -> None:
+    """A sample that does not reconstruct is an error, not a shorter sample."""
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    _, chunked = monolith_and_chunked
+    archive, expected = _damaged_archives(chunked, tmp_path)[damage]
+    with pytest.raises(ValueError) as caught:
+        await read_eval_log_sample_async(str(archive), "s", 1)
+    assert expected in str(caught.value)
+    assert str(archive) in str(caught.value)
+
+
+@pytest.fixture
+def events_outrun_the_conversation(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A converted sample whose final conversation is a prefix of the message pool.
+
+    The shell's `message_refs` then reach none of the pool's later rows, so only
+    the events' own refs can catch a truncated messages sequence.
+    """
+    log = _round_trip_log()
+    assert log.samples is not None
+    log.samples[0].messages = log.samples[0].messages[:2]
+    monolith = tmp_path / "log.eval"
+    write_eval_log(log, str(monolith), "eval")
+    convert_eval_logs_to_chunked(str(monolith), str(tmp_path / "chunked"), chunk_size=2)
+    return tmp_path / "chunked" / "log.eval"
+
+
+@pytest.mark.parametrize(
+    "sequence, expected",
+    [("messages", "refers to messages"), ("events", "uuids.json records")],
+)
+async def test_read_chunked_sample_rejects_a_truncated_sequence(
+    events_outrun_the_conversation: pathlib.Path,
+    tmp_path: pathlib.Path,
+    sequence: str,
+    expected: str,
+) -> None:
+    """A missing *last* chunk leaves the remaining names contiguous.
+
+    Dropping it silently shortened a model event's recorded prompt, and the
+    events sequence outright. What catches each is the refs into the pools and
+    the uuids sidecar's one entry per event.
+    """
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    chunked = events_outrun_the_conversation
+    with zipfile.ZipFile(chunked) as zf:
+        last = _chunk_starts(set(zf.namelist()), "s", 1, sequence)[-1]
+    truncated = _rewritten_archive(
+        chunked,
+        tmp_path / f"{sequence}_tail.eval",
+        drop=lambda name: name == chunk_entry_name("s", 1, sequence, last),
+    )
+    with pytest.raises(ValueError, match=expected):
+        await read_eval_log_sample_async(str(truncated), "s", 1)
+
+
+class EmbeddedRef(NamedTuple):
+    """A converted log whose store cites a real attachment inside a longer string."""
+
+    hash: str
+    chunked: pathlib.Path
+
+
+@pytest.fixture
+def embedded_ref(tmp_path: pathlib.Path) -> EmbeddedRef:
+    log = _round_trip_log()
+    assert log.samples is not None
+    sample = log.samples[0]
+    # cite the long tool output, which the monolith writer extracts
+    hash = mm3_hash(sample.messages[3].text)
+    sample.store = {"note": f"see attachment://{hash} here"}
+    monolith = tmp_path / "log.eval"
+    write_eval_log(log, str(monolith), "eval")
+    convert_eval_logs_to_chunked(str(monolith), str(tmp_path / "chunked"), chunk_size=2)
+    return EmbeddedRef(hash, tmp_path / "chunked" / "log.eval")
+
+
+async def test_read_chunked_sample_restores_a_ref_inside_a_longer_string(
+    embedded_ref: EmbeddedRef,
+) -> None:
+    """The converter renumbers refs anywhere in the JSON, so the read restores them there.
+
+    `resolve_sample_attachments` only substitutes a ref that is a whole string,
+    so an embedded one stays a ref either way; what this pins is that it comes
+    back in the hash namespace the monolith used, not in the archive's index
+    namespace, which nothing outside the chunked reader understands.
+    """
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    hash, chunked = embedded_ref
+    # the converter did renumber it in place
+    with zipfile.ZipFile(chunked) as zf:
+        stored = json.loads(zf.read(shell_entry_name("s", 1)))["store"]["note"]
+    assert re.fullmatch(r"see attachment://\d+ here", stored)
+
+    actual = await read_eval_log_sample_async(str(chunked), "s", 1)
+    assert actual.store == {"note": f"see attachment://{hash} here"}
+    assert hash in actual.attachments
+
+
+class RefShapedStore(NamedTuple):
+    """A log whose sample stores a string in the shape of an attachment ref."""
+
+    note: str
+    monolith: pathlib.Path
+    chunked: pathlib.Path
+
+
+@pytest.fixture
+def ref_shaped_store(
+    request: pytest.FixtureRequest, tmp_path: pathlib.Path
+) -> RefShapedStore:
+    log = _round_trip_log()
+    assert log.samples is not None
+    log.samples[0].store = {"note": request.param}
+    monolith = tmp_path / "log.eval"
+    write_eval_log(log, str(monolith), "eval")
+    convert_eval_logs_to_chunked(str(monolith), str(tmp_path / "chunked"), chunk_size=2)
+    return RefShapedStore(request.param, monolith, tmp_path / "chunked" / "log.eval")
+
+
+@pytest.mark.parametrize(
+    "ref_shaped_store",
+    [
+        "attachment://0",
+        "attachment://0abc",
+        "attachment://999",
+        "attachment://2024-01-01/report.pdf",
+    ],
+    indirect=True,
+)
+async def test_read_chunked_sample_cannot_tell_user_text_from_a_ref(
+    ref_shaped_store: RefShapedStore,
+) -> None:
+    """Text beginning `attachment://` and digits does not survive the conversion.
+
+    The converter renumbers refs to `attachment://<index>` in the serialized
+    JSON, after which nothing distinguishes them from text a user wrote in that
+    shape — whatever follows the digits, and wherever the text sits. An in-range
+    index reads back as a reference to that attachment, the rest of the string
+    kept; an out-of-range one is indistinguishable from an incomplete
+    attachments sequence, so the read refuses rather than handing back a token
+    nothing resolves.
+    """
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    note, monolith, chunked = ref_shaped_store
+    # the monolith keeps the string either way: an unknown hash is left alone
+    expected = await read_eval_log_sample_async(str(monolith), "s", 1)
+    assert expected.store == {"note": note}
+    assert (
+        await read_eval_log_sample_async(
+            str(monolith), "s", 1, resolve_attachments=True
+        )
+    ).store == {"note": note}
+
+    digits = re.match(r"attachment://(\d+)", note)
+    assert digits is not None
+    if int(digits.group(1)) < len(expected.attachments):
+        actual = await read_eval_log_sample_async(str(chunked), "s", 1)
+        hash, tail = str(actual.store["note"]).removeprefix("attachment://"), ""
+        hash, tail = hash[:32], hash[32:]
+        assert hash in actual.attachments
+        assert tail == note[digits.end() :]
+    else:
+        with pytest.raises(ValueError, match=f"attachment {digits.group(1)}"):
+            await read_eval_log_sample_async(str(chunked), "s", 1)
+
+
+def test_chunked_index_refs_are_restored_wherever_they_appear() -> None:
+    """`attachment://<n>` is restored anywhere in the JSON, as the writer renumbered it."""
+    from inspect_ai.log._recorders.chunked.read import _INDEX_REF
+
+    data = b'{"a": "attachment://0", "b": "attachment://0abc", "c": "see attachment://1 here"}'
+    assert _INDEX_REF.sub(b"REF", data) == (
+        b'{"a": "REF", "b": "REFabc", "c": "see REF here"}'
+    )

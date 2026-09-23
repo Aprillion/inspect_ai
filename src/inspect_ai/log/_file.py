@@ -715,7 +715,10 @@ def read_eval_log_sample(
           (defaults to 'auto' based on `log_file` extension)
        exclude_fields (set[str] | None): Set of field names to exclude when reading
           the sample. Useful when reading large samples with fields like
-          'store' or 'attachments' that aren't needed.
+          'store' or 'attachments' that aren't needed. In a log converted to
+          the chunked layout the attachment contents are read regardless,
+          because the sample's other fields reference them, so excluding
+          'attachments' there saves only the returned map.
           Ignored for .json format logs (only applies to .eval logs).
 
     Returns:
@@ -780,7 +783,10 @@ async def read_eval_log_sample_async(
           (defaults to 'auto' based on `log_file` extension)
        exclude_fields (set[str] | None): Set of field names to exclude when reading
           the sample. Useful when reading large samples with fields like
-          'store' or 'attachments' that aren't needed.
+          'store' or 'attachments' that aren't needed. In a log converted to
+          the chunked layout the attachment contents are read regardless,
+          because the sample's other fields reference them, so excluding
+          'attachments' there saves only the returned map.
           Ignored for .json format logs (only applies to .eval logs).
        reader (AsyncZipReader | None): Optional async zip reader to use when reading the sample.
 
@@ -854,7 +860,10 @@ def read_eval_log_samples_by_id(
           (defaults to 'auto' based on `log_file` extension)
        exclude_fields (set[str] | None): Set of field names to exclude when reading
           each sample. Useful when reading large samples with fields like
-          'store' or 'attachments' that aren't needed.
+          'store' or 'attachments' that aren't needed. In a log converted to
+          the chunked layout the attachment contents are read regardless,
+          because the sample's other fields reference them, so excluding
+          'attachments' there saves only the returned map.
 
     Returns:
        List of EvalSample objects in the same order as `samples`.
@@ -932,7 +941,10 @@ async def read_eval_log_samples_by_id_async(
           (defaults to 'auto' based on `log_file` extension)
        exclude_fields (set[str] | None): Set of field names to exclude when reading
           each sample. Useful when reading large samples with fields like
-          'store' or 'attachments' that aren't needed.
+          'store' or 'attachments' that aren't needed. In a log converted to
+          the chunked layout the attachment contents are read regardless,
+          because the sample's other fields reference them, so excluding
+          'attachments' there saves only the returned map.
        reader (AsyncZipReader | None): Optional async zip reader to share across
           the concurrent reads. A single reader is safe to reuse because each
           member read issues independent byte-range requests; the only shared
@@ -1056,7 +1068,10 @@ def read_eval_log_samples(
           (defaults to 'auto' based on `log_file` extension)
        exclude_fields (set[str] | None): Set of field names to exclude when reading
           the sample. Useful when reading large samples with fields like
-          'store' or 'attachments' that aren't needed.
+          'store' or 'attachments' that aren't needed. In a log converted to
+          the chunked layout the attachment contents are read regardless,
+          because the sample's other fields reference them, so excluding
+          'attachments' there saves only the returned map.
           Ignored for .json format logs (only applies to .eval logs).
 
     Returns:

@@ -1,5 +1,6 @@
 ## Unreleased
 
+- `read_eval_log_sample()` now reads samples from logs converted to the chunked per-sample layout instead of raising `IndexError`.
 - Sandbox agent bridge: host tools exposed with `bridged_tools` are again denied unless the model proposed the call in a bridged generation, once per proposal, with or without an approval policy (0.3.265 ran them regardless as a stopgap); `BridgedToolsSpec(require_proposal=False)` opts a server out.
 
 ## 0.3.268 (22 September 2026)
